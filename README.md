@@ -15,12 +15,12 @@ Watch the How-To Video! Click on the Thumbnail!
 
 1. Queries Blackmagic's API for the latest stable Linux version
 2. Compares against your currently installed version
-3. Installs all runtime dependencies (official repos + AUR)
-4. Downloads the ~3GB zip, submitting the web registration form for you with your saved info
-5. Fetches the latest `davinci-resolve` PKGBUILD from the AUR
+3. Manages the AUR repository (clones it or runs `git pull` on the existing repo)
+4. Dynamically inspects dependencies directly from the AUR `PKGBUILD` and satisfies them via `pacman`/AUR helper
+5. Downloads the ~3GB zip, submitting the web registration form for you with your saved info
 6. Patches `pkgver` if the AUR is behind the latest release
 7. Applies a defensive patch to the AUR `prepare()` step when it hardcodes a stale bundled library version (see Troubleshooting)
-8. Regenerates SHA256 checksums
+8. Regenerates SHA256 checksums if necessary
 9. Builds and installs via `makepkg -sric` (stays tracked in pacman/yay)
 10. Checks that Resolve's runtime support directories exist, and prints fix instructions if not
 
@@ -30,40 +30,14 @@ Watch the How-To Video! Click on the Thumbnail!
 - `jq`
 - `git`
 - `makepkg` / `pacman` (included with Arch)
-- `yay` or `paru` (AUR helper — needed for AUR-only runtime deps)
+- `paru` or `yay` (AUR helper — needed for AUR-only runtime deps)
 - `updpkgsums` (optional, from `pacman-contrib` — falls back to manual hash update)
 
-If you don't have an AUR helper installed, the script will tell you how to install `yay`.
-If a dependency install fails, the script will exit, and manual intervention to get that dependency package installed will be required. Re-run the script after you have the problematic dependency installed.
+If you don't have an AUR helper installed, the script will automatically install `paru`.
 
 ## Runtime dependencies
 
-The script automatically installs these before building. Packages in official repos are installed via `pacman`; AUR-only packages are installed via your AUR helper. When a package has multiple providers, the first option is selected automatically.
-
-| Package | Source |
-|---------|--------|
-| `glu` | official |
-| `gtk2` | official |
-| `libpng12` | AUR |
-| `fuse2` | official |
-| `opencl-driver` | official (multiple providers) |
-| `qt5-x11extras` | official |
-| `qt5-svg` | official |
-| `qt5-webengine` | AUR |
-| `qt5-websockets` | official |
-| `qt5-quickcontrols2` | official |
-| `qt5-multimedia` | official |
-| `libxcrypt-compat` | AUR |
-| `xmlsec` | official |
-| `java-runtime` | official (multiple providers) |
-| `ffmpeg4.4` | AUR |
-| `gst-plugins-bad-libs` | official |
-| `python-numpy` | official |
-| `tbb` | official |
-| `apr-util` | official |
-| `luajit` | official |
-| `libc++` | AUR |
-| `libc++abi` | AUR |
+Dependencies are dynamically read from the AUR package's `PKGBUILD` / `.SRCINFO` at runtime. Packages in official repos are installed via `pacman`; AUR-only packages are installed via your AUR helper. When a package has multiple providers, the first option is selected automatically.
 
 ## Installation
 
@@ -82,7 +56,7 @@ ln -s "$(pwd)/update-resolve.sh" ~/.local/bin/update-resolve
 ## Usage
 
 ```bash
-# Standard update (checks version, downloads, builds, installs)
+# Standard update (checks version, pulls AUR repo, downloads, builds, installs)
 ./update-resolve.sh
 
 # Just check if an update is available

@@ -4,7 +4,7 @@
 #
 # Usage: ./update-resolve.sh [--force] [--check-only] [--skip-install] [--reconfigure]
 #
-# Dependencies: curl, jq, makepkg, pacman, git
+# Dependencies: curl, jq, makepkg, pacman, git, paru/yay
 #
 # On first run, you'll be prompted for registration info (required by
 # Blackmagic's download API). Your info is saved locally in a config
@@ -21,6 +21,15 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 BUILD_DIR="${SCRIPT_DIR}/build"
 CONFIG_FILE="${SCRIPT_DIR}/.config"
 PRODUCT="davinci-resolve"  # Change to "davinci-resolve-studio" for Studio edition
+
+# AUR repository directory (self-contained in current folder / build directory)
+if [[ -f "./PKGBUILD" ]]; then
+    AUR_DIR="$(pwd)"
+elif [[ -f "${SCRIPT_DIR}/PKGBUILD" ]]; then
+    AUR_DIR="${SCRIPT_DIR}"
+else
+    AUR_DIR="${BUILD_DIR}/${PRODUCT}"
+fi
 
 # Blackmagic API endpoints
 API_BASE="https://www.blackmagicdesign.com/api"
@@ -55,12 +64,13 @@ FORCE=false
 CHECK_ONLY=false
 SKIP_INSTALL=false
 RECONFIGURE=false
-for arg in "$@"; do
-    case $arg in
-        --force) FORCE=true ;;
-        --check-only) CHECK_ONLY=true ;;
-        --skip-install) SKIP_INSTALL=true ;;
-        --reconfigure) RECONFIGURE=true ;;
+
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --force) FORCE=true; shift ;;
+        --check-only) CHECK_ONLY=true; shift ;;
+        --skip-install) SKIP_INSTALL=true; shift ;;
+        --reconfigure) RECONFIGURE=true; shift ;;
         -h|--help)
             echo "Usage: $0 [--force] [--check-only] [--skip-install] [--reconfigure]"
             echo "  --force        Update even if already on latest version"
@@ -69,7 +79,7 @@ for arg in "$@"; do
             echo "  --reconfigure  Re-enter registration info"
             exit 0
             ;;
-        *) err "Unknown argument: $arg"; exit 1 ;;
+        *) err "Unknown argument: $1"; exit 1 ;;
     esac
 done
 
@@ -126,7 +136,7 @@ load_config() {
     fi
 
     # Read config safely — no shell evaluation, just plain key=value parsing
-    _cfg() { grep "^$1=" "$CONFIG_FILE" | cut -d= -f2-; }
+    _cfg() { grep "^$1=" "$CONFIG_FILE" 2>/dev/null | cut -d= -f2- || true; }
     local cfg_firstname cfg_lastname cfg_email cfg_phone cfg_country cfg_state cfg_city cfg_street
     cfg_firstname=$(_cfg firstname)
     cfg_lastname=$(_cfg lastname)
@@ -150,29 +160,101 @@ load_config() {
         '{firstname:$fn, lastname:$ln, email:$em, phone:$ph, country:$co, state:$st, city:$ci, street:$sr, product:"DaVinci Resolve"}')
 }
 
+sync_aur_repo() {
+    log "Preparing AUR package repository..."
+    mkdir -p "$AUR_DIR"
+    if [[ -d "${AUR_DIR}/.git" ]]; then
+        log "Found existing AUR git repository at: ${AUR_DIR}"
+        log "Updating AUR repository via git pull..."
+        # Revert any previously patched tracked files so git pull updates cleanly
+        git -C "$AUR_DIR" checkout -- PKGBUILD .SRCINFO 2>/dev/null || true
+        if git -C "$AUR_DIR" pull --ff-only 2>/dev/null; then
+            ok "AUR repository updated to latest commit"
+        else
+            warn "Fast-forward git pull was not possible; attempting standard pull"
+            git -C "$AUR_DIR" pull || warn "Could not pull latest changes; continuing with local repository as-is"
+        fi
+    else
+        log "Cloning AUR repository for ${PRODUCT} into ${AUR_DIR}..."
+        git clone "https://aur.archlinux.org/${PRODUCT}.git" "$AUR_DIR"
+        ok "Cloned AUR repository"
+    fi
+
+    # Ensure local git exclude ignores build artifacts and downloads so git status remains clean
+    if [[ -d "${AUR_DIR}/.git" ]]; then
+        local exclude_file="${AUR_DIR}/.git/info/exclude"
+        mkdir -p "${AUR_DIR}/.git/info"
+        touch "$exclude_file"
+        for pattern in "*.zip" "*.pkg.tar.*" "src/" "pkg/" "squashfs-root/"; do
+            if ! grep -qxF "$pattern" "$exclude_file" 2>/dev/null; then
+                echo "$pattern" >> "$exclude_file"
+            fi
+        done
+    fi
+}
+
 # --- Dependency Management ---
 
-# Runtime dependencies from the AUR PKGBUILD
-RESOLVE_DEPS=(
-    glu gtk2 libpng12 fuse2 opencl-driver
-    qt5-x11extras qt5-svg qt5-webengine qt5-websockets qt5-quickcontrols2 qt5-multimedia
-    libxcrypt-compat xmlsec java-runtime ffmpeg4.4
-    gst-plugins-bad-libs python-numpy tbb apr-util luajit
-    libc++ libc++abi
-)
+install_paru() {
+    log "AUR helper not found. Installing paru..."
+    sudo pacman -S --needed --noconfirm git base-devel
+    local helper_dir="${BUILD_DIR}/paru-bin"
+    rm -rf "$helper_dir"
+    mkdir -p "$BUILD_DIR"
+    if git clone "https://aur.archlinux.org/paru-bin.git" "$helper_dir" 2>/dev/null; then
+        (cd "$helper_dir" && yes "" | makepkg -si --noconfirm)
+    elif git clone "https://aur.archlinux.org/paru.git" "$helper_dir" 2>/dev/null; then
+        (cd "$helper_dir" && yes "" | makepkg -si --noconfirm)
+    fi
+
+    if command -v paru &>/dev/null; then
+        ok "paru installed successfully"
+        return 0
+    else
+        err "Failed to install paru automatically"
+        return 1
+    fi
+}
 
 install_dependencies() {
-    log "Checking runtime dependencies..."
+    log "Checking runtime & build dependencies from AUR PKGBUILD..."
+
+    local deps=()
+    # Read depends and makedepends directly from AUR PKGBUILD / .SRCINFO
+    if [[ -f "${AUR_DIR}/.SRCINFO" ]]; then
+        mapfile -t deps < <(grep -E '^\s*(depends|makedepends)\s*=' "${AUR_DIR}/.SRCINFO" | awk '{print $3}' | sed 's/[<>=].*//' | sort -u)
+    fi
+
+    # Fallback to makepkg --printsrcinfo if .SRCINFO is absent or empty
+    if [[ ${#deps[@]} -eq 0 && -f "${AUR_DIR}/PKGBUILD" ]]; then
+        mapfile -t deps < <((cd "$AUR_DIR" && makepkg --printsrcinfo 2>/dev/null) | grep -E '^\s*(depends|makedepends)\s*=' | awk '{print $3}' | sed 's/[<>=].*//' | sort -u)
+    fi
+
+    if [[ ${#deps[@]} -eq 0 ]]; then
+        warn "Could not parse dependencies from PKGBUILD; skipping automatic dependency check."
+        return 0
+    fi
+
+    # Use pacman -T to identify missing dependencies (respects 'provides' like opencl-nvidia)
+    local missing=()
+    mapfile -t missing < <(pacman -T "${deps[@]}" 2>/dev/null || true)
+
+    local actual_missing=()
+    for p in "${missing[@]}"; do
+        [[ -n "$p" ]] && actual_missing+=("$p")
+    done
+
+    if [[ ${#actual_missing[@]} -eq 0 ]]; then
+        ok "All dependencies already installed and satisfied"
+        return 0
+    fi
+
+    log "Missing dependencies detected: ${actual_missing[*]}"
 
     local missing_repo=()
     local missing_aur=()
 
-    for pkg in "${RESOLVE_DEPS[@]}"; do
-        # Skip if already installed (check provides too)
-        if pacman -Q "$pkg" &>/dev/null || pacman -Qq -g "$pkg" &>/dev/null; then
-            continue
-        fi
-
+    for pkg in "${actual_missing[@]}"; do
         # Check if available in official repos
         if pacman -Si "$pkg" &>/dev/null 2>&1; then
             missing_repo+=("$pkg")
@@ -183,7 +265,7 @@ install_dependencies() {
 
     # Install official repo packages
     if [[ ${#missing_repo[@]} -gt 0 ]]; then
-        log "Installing from official repos: ${missing_repo[*]}"
+        log "Installing missing official repo packages: ${missing_repo[*]}"
         # yes "" auto-selects the default when pacman prompts for a provider choice.
         # When pacman finishes it closes stdin, causing yes to exit 141 (SIGPIPE).
         # With pipefail that would kill the script, so we check pacman's exit code directly.
@@ -194,26 +276,27 @@ install_dependencies() {
     # Install AUR packages
     if [[ ${#missing_aur[@]} -gt 0 ]]; then
         local aur_helper=""
-        if command -v yay &>/dev/null; then
-            aur_helper="yay"
-        elif command -v paru &>/dev/null; then
+        if command -v paru &>/dev/null; then
             aur_helper="paru"
-        fi
-
-        if [[ -n "$aur_helper" ]]; then
-            log "Installing from AUR via ${aur_helper}: ${missing_aur[*]}"
-            yes "" | "$aur_helper" -S --needed --noconfirm "${missing_aur[@]}" || [[ ${PIPESTATUS[1]} -eq 0 ]]
-            ok "AUR dependencies installed"
+        elif command -v yay &>/dev/null; then
+            aur_helper="yay"
         else
-            err "The following packages are only available in the AUR: ${missing_aur[*]}"
-            err "Install an AUR helper first: sudo pacman -S --needed git base-devel && git clone https://aur.archlinux.org/yay.git && cd yay && makepkg -si"
-            return 1
+            log "No AUR helper found on system. Installing paru..."
+            if install_paru; then
+                aur_helper="paru"
+            else
+                err "The following packages are only available in the AUR: ${missing_aur[*]}"
+                err "Install an AUR helper first: sudo pacman -S --needed git base-devel && git clone https://aur.archlinux.org/paru-bin.git && cd paru-bin && makepkg -si"
+                return 1
+            fi
         fi
+
+        log "Installing missing AUR packages via ${aur_helper}: ${missing_aur[*]}"
+        yes "" | "$aur_helper" -S --needed --noconfirm "${missing_aur[@]}" || [[ ${PIPESTATUS[1]} -eq 0 ]]
+        ok "AUR dependencies installed"
     fi
 
-    if [[ ${#missing_repo[@]} -eq 0 && ${#missing_aur[@]} -eq 0 ]]; then
-        ok "All dependencies already installed"
-    fi
+    ok "All dependencies satisfied"
 }
 
 # --- Core Functions ---
@@ -251,7 +334,14 @@ download_resolve() {
     local download_id="$1"
     local version="$2"
     local zip_name="DaVinci_Resolve_${version}_Linux.zip"
-    local zip_path="${BUILD_DIR}/${zip_name}"
+    mkdir -p "$AUR_DIR"
+    local zip_path="${AUR_DIR}/${zip_name}"
+
+    # If the zip is already in BUILD_DIR, link it to AUR_DIR
+    if [[ ! -f "$zip_path" && -f "${BUILD_DIR}/${zip_name}" ]]; then
+        log "Found existing zip in ${BUILD_DIR}, linking to ${AUR_DIR}..."
+        ln -sf "${BUILD_DIR}/${zip_name}" "$zip_path"
+    fi
 
     if [[ -f "$zip_path" && "$FORCE" != "true" ]]; then
         ok "Zip already downloaded: ${zip_name}"
@@ -292,24 +382,19 @@ download_resolve() {
     fi
 }
 
-# Step 4: Fetch and update PKGBUILD
+# Step 4: Configure PKGBUILD
 setup_pkgbuild() {
     local version="$1"
 
-    log "Fetching latest PKGBUILD from AUR..."
-    pushd "$BUILD_DIR" > /dev/null
+    log "Configuring PKGBUILD in ${AUR_DIR}..."
+    pushd "$AUR_DIR" > /dev/null
 
-    # Clean previous build artifacts but keep downloaded zips
-    find . -maxdepth 1 ! -name "*.zip" ! -name "." -exec rm -rf {} + 2>/dev/null || true
-
-    # Fetch PKGBUILD from AUR
-    git clone --depth 1 "https://aur.archlinux.org/${PRODUCT}.git" _aur_pkg 2>/dev/null
-    cp _aur_pkg/* . 2>/dev/null || true
-    rm -rf _aur_pkg
+    # Clean previous build scratch artifacts but keep git repo and downloaded zips
+    rm -rf src pkg squashfs-root *.pkg.tar* 2>/dev/null || true
 
     # Verify PKGBUILD exists
     if [[ ! -f "PKGBUILD" ]]; then
-        err "Failed to fetch PKGBUILD from AUR"
+        err "PKGBUILD not found in ${AUR_DIR}"
         popd > /dev/null
         return 1
     fi
@@ -321,38 +406,41 @@ setup_pkgbuild() {
     # 21.1), so the literal filename goes stale and prepare() aborts on
     # `rm: cannot remove ...: No such file or directory`. Replacing the
     # hardcoded suffixes with globs keeps the same targets, version-agnostic.
-    # Self-retiring: this is an exact literal match, not a pattern. The moment
-    # the AUR maintainer edits this block at all, the old text disappears and
-    # this substitution silently no-ops, so it is safe to leave in permanently.
-    # NOTE: the pattern MUST stay quoted in the substitution below. Unquoted,
-    # bash treats the backslash line-continuations in it as escapes and the
-    # replacement silently does nothing while still reporting a match.
-    local broken_rm_block='rm squashfs-root/libs/libglib-2.0.so.0{,.6800.4} \
+    local broken_rm_block_68='rm squashfs-root/libs/libglib-2.0.so.0{,.6800.4} \
      squashfs-root/libs/libgio-2.0.so.0{,.6800.4} \
      squashfs-root/libs/libgmodule-2.0.so.0{,.6800.4} \
      squashfs-root/libs/libgobject-2.0.so.0{,.6800.4} \
      squashfs-root/libs/libc++.so.1{,.0} \
      squashfs-root/libs/libc++abi.so.1{,.0}'
+
+    local broken_rm_block_82='rm squashfs-root/libs/libglib-2.0.so.0{,.8200.4} \
+     squashfs-root/libs/libgio-2.0.so.0{,.8200.4} \
+     squashfs-root/libs/libgmodule-2.0.so.0{,.8200.4} \
+     squashfs-root/libs/libgobject-2.0.so.0{,.8200.4} \
+     squashfs-root/libs/libc++.so.1{,.0} \
+     squashfs-root/libs/libc++abi.so.1{,.0}'
+
     local fixed_rm_block='rm -f squashfs-root/libs/libglib-2.0.so.0* \
      squashfs-root/libs/libgio-2.0.so.0* \
      squashfs-root/libs/libgmodule-2.0.so.0* \
      squashfs-root/libs/libgobject-2.0.so.0* \
      squashfs-root/libs/libc++.so.1* \
      squashfs-root/libs/libc++abi.so.1*'
+
     local pkgbuild_content
     pkgbuild_content=$(<PKGBUILD)
-    if [[ "$pkgbuild_content" == *"$broken_rm_block"* ]]; then
-        warn "Patching known-fragile AUR prepare() step (hardcoded glib bundle version)"
-        pkgbuild_content="${pkgbuild_content//"$broken_rm_block"/"$fixed_rm_block"}"
-        if [[ "$pkgbuild_content" == *"$broken_rm_block"* ]]; then
-            err "Defensive patch failed to apply — build would abort in prepare()"
-            popd > /dev/null
-            return 1
-        fi
+    if [[ "$pkgbuild_content" == *"$broken_rm_block_68"* ]]; then
+        warn "Patching known-fragile AUR prepare() step (glib 2.68 bundle version)"
+        pkgbuild_content="${pkgbuild_content//"$broken_rm_block_68"/"$fixed_rm_block"}"
+        printf '%s\n' "$pkgbuild_content" > PKGBUILD
+        ok "Patched AUR prepare() glib strip step to be version-agnostic"
+    elif [[ "$pkgbuild_content" == *"$broken_rm_block_82"* ]]; then
+        warn "Patching known-fragile AUR prepare() step (glib 2.82 bundle version)"
+        pkgbuild_content="${pkgbuild_content//"$broken_rm_block_82"/"$fixed_rm_block"}"
         printf '%s\n' "$pkgbuild_content" > PKGBUILD
         ok "Patched AUR prepare() glib strip step to be version-agnostic"
     else
-        log "AUR PKGBUILD prepare() already changed upstream — skipping defensive patch"
+        log "AUR PKGBUILD prepare() glib strip step does not need defensive patch"
     fi
 
     # Check if AUR PKGBUILD version matches what we're building
@@ -368,29 +456,33 @@ setup_pkgbuild() {
     # Verify the zip file is in the build directory
     local zip_name="DaVinci_Resolve_${version}_Linux.zip"
     if [[ ! -f "$zip_name" ]]; then
-        err "Zip file not found: ${BUILD_DIR}/${zip_name}"
+        err "Zip file not found: ${AUR_DIR}/${zip_name}"
         popd > /dev/null
         return 1
     fi
 
     # Update sha256sums
-    log "Generating sha256sums..."
+    log "Verifying sha256sums..."
     local new_hash
     new_hash=$(sha256sum "$zip_name" | awk '{print $1}')
-    # Use updpkgsums if available, otherwise manual update
-    if command -v updpkgsums &>/dev/null; then
-        updpkgsums 2>/dev/null
-        ok "Updated sha256sums via updpkgsums"
-    else
-        # Manual update: replace the first hash in sha256sums array
-        local old_hash
-        old_hash=$(grep -A1 "^sha256sums=" PKGBUILD | tail -1 | tr -d "' " | head -c 64)
-        if [[ -n "$old_hash" && ${#old_hash} -eq 64 ]]; then
-            sed -i "s/${old_hash}/${new_hash}/" PKGBUILD
-            ok "Updated zip sha256sum: ${new_hash:0:16}..."
+    local old_hash
+    old_hash=$(grep -A1 "^sha256sums=" PKGBUILD | tail -1 | tr -d "' \t" | head -c 64)
+
+    if [[ "$old_hash" != "$new_hash" ]]; then
+        log "Updating sha256sum in PKGBUILD..."
+        if command -v updpkgsums &>/dev/null; then
+            updpkgsums 2>/dev/null
+            ok "Updated sha256sums via updpkgsums"
         else
-            warn "Could not auto-update sha256sum. You may need to run 'updpkgsums' manually."
+            if [[ -n "$old_hash" && ${#old_hash} -eq 64 ]]; then
+                sed -i "s/${old_hash}/${new_hash}/" PKGBUILD
+                ok "Updated zip sha256sum: ${new_hash:0:16}..."
+            else
+                warn "Could not auto-update sha256sum. You may need to run 'updpkgsums' manually."
+            fi
         fi
+    else
+        ok "sha256sums already match"
     fi
 
     popd > /dev/null
@@ -398,8 +490,12 @@ setup_pkgbuild() {
 
 # Step 5: Build and install
 build_and_install() {
-    log "Building package with makepkg (this takes a while)..."
-    pushd "$BUILD_DIR" > /dev/null
+    log "Building package with makepkg in ${AUR_DIR}..."
+    pushd "$AUR_DIR" > /dev/null
+
+    # Arch Wiki tip (Decrease installation time): disable zstd compression
+    # to avoid spending minutes compressing a ~10GB package that will be installed immediately.
+    export PKGEXT='.pkg.tar'
 
     if [[ "$SKIP_INSTALL" == "true" ]]; then
         yes "" | makepkg -sf --noconfirm || [[ ${PIPESTATUS[1]} -eq 0 ]]
@@ -413,17 +509,14 @@ build_and_install() {
 }
 
 # Step 6: Warn about runtime support directories Resolve cannot create itself.
-# /opt/resolve is root-owned 0755, so any support directory Resolve still needs
-# to create at first launch fails, and the app exits with "Failed to create
-# application support directories" before it can even write a log. Blackmagic
-# adds to this set across releases (21.1 introduced Immersive/), so this only
-# warns and prints the fix rather than acting, and deliberately treats its list
-# as a floor rather than pretending to be complete.
 check_runtime_dirs() {
     local resolve_dir="/opt/resolve"
     [[ -d "$resolve_dir" ]] || return 0
 
-    local needed=("Immersive")
+    # Immersive: Resolve 21.1 startup directory
+    # Extras: AI voice models and downloader
+    # .license: Studio edition license activation folder
+    local needed=("Immersive" "Extras" ".license")
     local broken=() d
     for d in "${needed[@]}"; do
         if [[ ! -d "${resolve_dir}/${d}" || ! -w "${resolve_dir}/${d}" ]]; then
@@ -437,18 +530,18 @@ check_runtime_dirs() {
     fi
 
     echo ""
-    warn "Resolve will likely fail to launch with 'Failed to create application support directories'"
-    warn "Missing or not writable by $(id -un):"
+    warn "Resolve may fail to launch or activate if support directories are missing or non-writable."
+    warn "Directories needing attention:"
     for d in "${broken[@]}"; do
         echo "      ${resolve_dir}/${d}"
     done
     echo ""
     echo "  Fix with:"
     for d in "${broken[@]}"; do
-        echo "      sudo mkdir -p '${resolve_dir}/${d}' && sudo chown $(id -un):$(id -gn) '${resolve_dir}/${d}'"
+        echo "      sudo mkdir -p '${resolve_dir}/${d}' && sudo chown -R $(id -un):$(id -gn) '${resolve_dir}/${d}'"
     done
     echo ""
-    echo "  If it still fails, find the next one with:"
+    echo "  If it still fails, find any other missing paths with:"
     echo "      strace -f -e trace=mkdir,mkdirat davinci-resolve 2>&1 | grep -E 'EACCES|EPERM'"
     echo ""
 }
@@ -484,6 +577,8 @@ main() {
     # Load or create configuration
     load_config
 
+    log "Using AUR directory: ${AUR_DIR}"
+
     # Get versions
     local installed_version
     installed_version=$(get_installed_version)
@@ -517,13 +612,13 @@ main() {
         exit 0
     fi
 
-    # Install dependencies (repo + AUR)
+    # Sync / pull AUR repository
+    sync_aur_repo
+
+    # Install dependencies (dynamically resolved from AUR PKGBUILD)
     install_dependencies
 
-    # Create build directory
-    mkdir -p "$BUILD_DIR"
-
-    # Download
+    # Download installer
     download_resolve "$download_id" "$latest_version"
 
     # Setup PKGBUILD
@@ -539,6 +634,9 @@ main() {
     echo ""
     ok "DaVinci Resolve ${latest_version} installed successfully!"
     log "Run 'davinci-resolve' to launch."
+    if [[ "${XDG_SESSION_TYPE:-}" == "wayland" ]]; then
+        log "Note (Wayland): If Resolve fails with a Qt platform error, launch with: QT_QPA_PLATFORM=xcb davinci-resolve"
+    fi
 }
 
 main "$@"
